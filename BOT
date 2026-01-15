@@ -1,36 +1,594 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+import logging
+import os
+import sqlite3
+from datetime import datetime
+from io import StringIO
+import csv
 
-async def start(update: Update, context):
-    user = update.effective_user
-    # Клавиатура главного меню
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler
+)
+
+# ===================== НАСТРОЙКИ =====================
+BOT_TOKEN = "7417771181:AAHYtMKQFlN2SZqBUIfK7hvE4HCohn8QaDg"
+ADMIN_ID = 5728828487  # Ваш Telegram ID
+
+# Файлы для скачивания (создайте папку files и положите туда файлы)
+FILES = {
+    'program': {'name': 'Программа мероприятия.pdf', 'path': 'files/program.pdf'},
+    'presentation': {'name': 'Презентация.pptx', 'path': 'files/presentation.pptx'},
+    'instructions': {'name': 'Инструкция по безопасности.docx', 'path': 'files/instructions.docx'},
+}
+
+# Тексты сообщений
+MESSAGES = {
+    'welcome': (
+        "👋 Добро пожаловать в бот мероприятия!\n\n"
+        "Здесь вы можете:\n"
+        "• 📝 Зарегистрироваться на мероприятие\n"
+        "• 📁 Скачать материалы\n"
+        "• ❓ Задать вопрос инспектору по охране труда\n"
+        "• 👤 Посмотреть свою информацию\n\n"
+        "Выберите действие:"
+    ),
+    'already_registered': "✅ Вы уже зарегистрированы!",
+    'registration_start': "Начнем регистрацию! Введите ваше ФИО:",
+    'ask_company': "Отлично! Теперь введите название вашей компании:",
+    'ask_position': "Введите вашу должность:",
+    'ask_email': "Введите ваш email:",
+    'ask_phone': "Введите ваш телефон:",
+    'registration_complete': (
+        "🎉 Регистрация завершена!\n\n"
+        "Ваши данные:\n"
+        "ФИО: {full_name}\n"
+        "Компания: {company}\n"
+        "Должность: {position}\n"
+        "Email: {email}\n"
+        "Телефон: {phone}\n\n"
+        "Теперь вы можете скачать материалы или задать вопрос."
+    ),
+    'ask_question_prompt': "Введите ваш вопрос инспектору по охране труда:\n\n(Вопрос будет передан анонимно)",
+    'question_received': "✅ Ваш вопрос получен! Спасибо за участие!",
+    'no_files': "📁 Файлы скоро будут доступны.",
+    'file_sent': "📄 Вот ваш файл:",
+    'no_info': "Вы еще не зарегистрированы. Нажмите 'Зарегистрироваться'.",
+}
+
+# ===================== БАЗА ДАННЫХ =====================
+class Database:
+    def __init__(self, db_path='event_bot.db'):
+        self.db_path = db_path
+        self.init_db()
+    
+    def get_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def init_db(self):
+        with self.get_connection() as conn:
+            # Таблица пользователей
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER UNIQUE,
+                    username TEXT,
+                    full_name TEXT NOT NULL,
+                    company TEXT NOT NULL,
+                    position TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    phone TEXT NOT NULL,
+                    registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Таблица вопросов
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS questions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    question_text TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'new'
+                )
+            ''')
+            
+            conn.commit()
+    
+    def add_user(self, user_data):
+        with self.get_connection() as conn:
+            try:
+                conn.execute('''
+                    INSERT INTO users (user_id, username, full_name, company, position, email, phone)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_data['user_id'],
+                    user_data.get('username'),
+                    user_data['full_name'],
+                    user_data['company'],
+                    user_data['position'],
+                    user_data['email'],
+                    user_data['phone']
+                ))
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+    
+    def get_user(self, user_id):
+        with self.get_connection() as conn:
+            cursor = conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+            return cursor.fetchone()
+    
+    def is_user_registered(self, user_id):
+        return self.get_user(user_id) is not None
+    
+    def add_question(self, user_id, question_text):
+        with self.get_connection() as conn:
+            conn.execute('''
+                INSERT INTO questions (user_id, question_text)
+                VALUES (?, ?)
+            ''', (user_id, question_text))
+            conn.commit()
+    
+    def get_stats(self):
+        with self.get_connection() as conn:
+            cursor = conn.execute('SELECT COUNT(*) as count FROM users')
+            user_count = cursor.fetchone()['count']
+            
+            cursor = conn.execute('SELECT COUNT(*) as count FROM questions')
+            question_count = cursor.fetchone()['count']
+            
+            cursor = conn.execute('SELECT COUNT(*) as count FROM questions WHERE status = "new"')
+            new_questions = cursor.fetchone()['count']
+            
+            return {
+                'users': user_count,
+                'questions': question_count,
+                'new_questions': new_questions
+            }
+    
+    def get_all_users(self):
+        with self.get_connection() as conn:
+            cursor = conn.execute('SELECT * FROM users ORDER BY registration_date')
+            return cursor.fetchall()
+    
+    def get_questions(self, status='new'):
+        with self.get_connection() as conn:
+            cursor = conn.execute('''
+                SELECT q.*, u.full_name 
+                FROM questions q
+                LEFT JOIN users u ON q.user_id = u.user_id
+                WHERE q.status = ?
+                ORDER BY q.timestamp
+            ''', (status,))
+            return cursor.fetchall()
+
+# Создаем глобальную базу данных
+db = Database()
+
+# ===================== КЛАВИАТУРЫ =====================
+def get_main_menu():
     keyboard = [
         [InlineKeyboardButton("📝 Зарегистрироваться", callback_data='register')],
-        [InlineKeyboardButton("📁 Материалы мероприятия", callback_data='files')],
-        [InlineKeyboardButton("❓ Задать вопрос инспектору", callback_data='ask_question')],
+        [InlineKeyboardButton("📁 Материалы", callback_data='materials')],
+        [InlineKeyboardButton("❓ Задать вопрос", callback_data='ask_question')],
         [InlineKeyboardButton("👤 Моя информация", callback_data='my_info')],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(keyboard)
+
+def get_materials_menu():
+    keyboard = []
+    for key, file_info in FILES.items():
+        keyboard.append([
+            InlineKeyboardButton(f"📄 {file_info['name']}", callback_data=f"file_{key}")
+        ])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='back')])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_button():
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back')]]
+    return InlineKeyboardMarkup(keyboard)
+
+# ===================== ОБРАБОТЧИКИ =====================
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Состояния для диалогов
+REGISTER_NAME, REGISTER_COMPANY, REGISTER_POSITION, REGISTER_EMAIL, REGISTER_PHONE = range(5)
+ASK_QUESTION = range(1)
+
+# Временное хранилище данных
+user_temp_data = {}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user = update.effective_user
+    logger.info(f"Пользователь {user.id} запустил бота")
+    
     await update.message.reply_text(
-        f"Привет, {user.first_name}!\n"
-        f"Добро пожаловать в бот мероприятия «День Безопасности».\n"
-        f"Выберите действие:",
-        reply_markup=reply_markup
+        MESSAGES['welcome'],
+        reply_markup=get_main_menu()
     )
 
-# Обработчики для callback_data (нажатий на кнопки меню)
-async def button_handler(update: Update, context):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data == 'register':
+        return await handle_registration(query, user_id)
+    elif data == 'materials':
+        await query.edit_message_text(
+            "📚 Выберите материал для скачивания:",
+            reply_markup=get_materials_menu()
+        )
+    elif data.startswith('file_'):
+        await handle_file_download(query, data)
+    elif data == 'ask_question':
+        return await handle_ask_question(query)
+    elif data == 'my_info':
+        await handle_my_info(query, user_id)
+    elif data == 'back':
+        await query.edit_message_text(
+            MESSAGES['welcome'],
+            reply_markup=get_main_menu()
+        )
+        return ConversationHandler.END
+    
+    return ConversationHandler.END
 
-    if query.data == 'register':
-        # Запускаем процесс регистрации
-        await query.edit_message_text(text="Введите ваше ФИО:")
-        # ... логика пошагового опроса ...
-    elif query.data == 'files':
-        # Показываем кнопки с файлами
-        file_keyboard = [
-            [InlineKeyboardButton("Программа (PDF)", callback_data='file_program')],
-            [InlineKeyboardButton("Презентация (PPTX)", callback_data='file_presentation')],
+async def handle_registration(query, user_id):
+    """Обработка начала регистрации"""
+    if db.is_user_registered(user_id):
+        await query.edit_message_text(
+            MESSAGES['already_registered'],
+            reply_markup=get_back_button()
+        )
+        return ConversationHandler.END
+    else:
+        user_temp_data[user_id] = {}
+        await query.edit_message_text(
+            MESSAGES['registration_start'],
+            reply_markup=get_back_button()
+        )
+        return REGISTER_NAME
+
+async def handle_file_download(query, data):
+    """Отправка файла пользователю"""
+    file_key = data.replace('file_', '')
+    
+    if file_key in FILES:
+        file_info = FILES[file_key]
+        file_path = file_info['path']
+        
+        if os.path.exists(file_path):
+            await query.message.reply_document(
+                document=open(file_path, 'rb'),
+                filename=file_info['name'],
+                caption=f"{MESSAGES['file_sent']} {file_info['name']}"
+            )
+        else:
+            await query.message.reply_text(
+                "❌ Файл временно недоступен. Попробуйте позже."
+            )
+    else:
+        await query.message.reply_text(MESSAGES['no_files'])
+
+async def handle_ask_question(query):
+    """Начать процесс вопроса"""
+    await query.edit_message_text(
+        MESSAGES['ask_question_prompt'],
+        reply_markup=get_back_button()
+    )
+    return ASK_QUESTION
+
+async def handle_my_info(query, user_id):
+    """Показать информацию о пользователе"""
+    user_data = db.get_user(user_id)
+    
+    if user_data:
+        info_text = (
+            "👤 Ваши данные:\n\n"
+            f"ФИО: {user_data['full_name']}\n"
+            f"Компания: {user_data['company']}\n"
+            f"Должность: {user_data['position']}\n"
+            f"Email: {user_data['email']}\n"
+            f"Телефон: {user_data['phone']}\n"
+            f"Дата регистрации: {user_data['registration_date']}"
+        )
+    else:
+        info_text = MESSAGES['no_info']
+    
+    await query.edit_message_text(
+        info_text,
+        reply_markup=get_back_button()
+    )
+
+# ===================== РЕГИСТРАЦИЯ =====================
+async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_temp_data[user_id] = {'full_name': update.message.text}
+    
+    await update.message.reply_text(
+        MESSAGES['ask_company'],
+        reply_markup=get_back_button()
+    )
+    return REGISTER_COMPANY
+
+async def register_company(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_temp_data[user_id]['company'] = update.message.text
+    
+    await update.message.reply_text(
+        MESSAGES['ask_position'],
+        reply_markup=get_back_button()
+    )
+    return REGISTER_POSITION
+
+async def register_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_temp_data[user_id]['position'] = update.message.text
+    
+    await update.message.reply_text(
+        MESSAGES['ask_email'],
+        reply_markup=get_back_button()
+    )
+    return REGISTER_EMAIL
+
+async def register_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_temp_data[user_id]['email'] = update.message.text
+    
+    await update.message.reply_text(
+        MESSAGES['ask_phone'],
+        reply_markup=get_back_button()
+    )
+    return REGISTER_PHONE
+
+async def register_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user = update.message.from_user
+    
+    # Сохраняем телефон
+    user_temp_data[user_id]['phone'] = update.message.text
+    user_temp_data[user_id]['user_id'] = user_id
+    user_temp_data[user_id]['username'] = user.username
+    
+    # Сохраняем в базу данных
+    success = db.add_user(user_temp_data[user_id])
+    
+    if success:
+        message = MESSAGES['registration_complete'].format(
+            full_name=user_temp_data[user_id]['full_name'],
+            company=user_temp_data[user_id]['company'],
+            position=user_temp_data[user_id]['position'],
+            email=user_temp_data[user_id]['email'],
+            phone=user_temp_data[user_id]['phone']
+        )
+        
+        # Оповещаем администратора
+        admin_message = (
+            "📥 Новая регистрация!\n\n"
+            f"Пользователь: {user.username or 'Без username'}\n"
+            f"ID: {user_id}\n"
+            f"ФИО: {user_temp_data[user_id]['full_name']}\n"
+            f"Компания: {user_temp_data[user_id]['company']}"
+        )
+        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_message)
+        
+        # Очищаем временные данные
+        user_temp_data.pop(user_id, None)
+        
+        await update.message.reply_text(
+            message,
+            reply_markup=get_main_menu()
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Ошибка при регистрации. Возможно, вы уже зарегистрированы.",
+            reply_markup=get_main_menu()
+        )
+    
+    return ConversationHandler.END
+
+async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение вопроса от пользователя"""
+    user_id = update.message.from_user.id
+    question_text = update.message.text
+    
+    # Сохраняем вопрос в базу
+    db.add_question(user_id, question_text)
+    
+    # Оповещаем администратора
+    user = update.message.from_user
+    admin_message = (
+        "❓ Новый вопрос от участника!\n\n"
+        f"От: {user.username or user.full_name}\n"
+        f"ID: {user_id}\n\n"
+        f"Вопрос:\n{question_text}"
+    )
+    await context.bot.send_message(chat_id=ADMIN_ID, text=admin_message)
+    
+    await update.message.reply_text(
+        MESSAGES['question_received'],
+        reply_markup=get_main_menu()
+    )
+    
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена действия"""
+    user_id = update.message.from_user.id
+    user_temp_data.pop(user_id, None)
+    
+    await update.message.reply_text(
+        "Действие отменено.",
+        reply_markup=get_main_menu()
+    )
+    return ConversationHandler.END
+
+# ===================== АДМИН-КОМАНДЫ =====================
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать статистику (только для админа)"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Доступ запрещен")
+        return
+    
+    stats = db.get_stats()
+    
+    message = (
+        "📊 Статистика бота:\n\n"
+        f"👥 Участников: {stats['users']}\n"
+        f"❓ Всего вопросов: {stats['questions']}\n"
+        f"🆕 Новых вопросов: {stats['new_questions']}"
+    )
+    
+    await update.message.reply_text(message)
+
+async def export_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экспорт пользователей в CSV (только для админа)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    users = db.get_all_users()
+    
+    if not users:
+        await update.message.reply_text("Нет данных для экспорта.")
+        return
+    
+    # Создаем CSV файл
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    # Заголовки
+    writer.writerow(['ID', 'Username', 'ФИО', 'Компания', 'Должность', 'Email', 'Телефон', 'Дата регистрации'])
+    
+    # Данные
+    for user in users:
+        writer.writerow([
+            user['user_id'],
+            user['username'] or '',
+            user['full_name'],
+            user['company'],
+            user['position'],
+            user['email'],
+            user['phone'],
+            user['registration_date']
+        ])
+    
+    # Отправляем файл
+    output.seek(0)
+    await update.message.reply_document(
+        document=output.getvalue().encode(),
+        filename='participants.csv',
+        caption=f"👥 Экспорт участников ({len(users)} человек)"
+    )
+
+async def export_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экспорт вопросов в CSV (только для админа)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    questions = db.get_questions(status='new')
+    
+    if not questions:
+        await update.message.reply_text("Нет вопросов для экспорта.")
+        return
+    
+    output = StringIO()
+    writer = csv.writer(output)
+    
+    writer.writerow(['ID', 'ФИО', 'Вопрос', 'Дата', 'Статус'])
+    
+    for q in questions:
+        writer.writerow([
+            q['id'],
+            q['full_name'] or 'Аноним',
+            q['question_text'],
+            q['timestamp'],
+            q['status']
+        ])
+    
+    output.seek(0)
+    
+    await update.message.reply_document(
+        document=output.getvalue().encode(),
+        filename='questions.csv',
+        caption=f"❓ Экспорт вопросов ({len(questions)} вопросов)"
+    )
+
+# ===================== ОСНОВНАЯ ФУНКЦИЯ =====================
+def main():
+    """Запуск бота"""
+    if not BOT_TOKEN:
+        logger.error("❌ Токен бота не установлен!")
+        return
+    
+    # Создаем приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # ConversationHandler для регистрации
+    registration_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^register$')],
+        states={
+            REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
+            REGISTER_COMPANY: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_company)],
+            REGISTER_POSITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_position)],
+            REGISTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_email)],
+            REGISTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_phone)],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(cancel, pattern='^back$')
         ]
-        # ... и т.д.
+    )
+    
+    # ConversationHandler для вопросов
+    question_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^ask_question$')],
+        states={
+            ASK_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_question)],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(cancel, pattern='^back$')
+        ]
+    )
+    
+    # Добавляем обработчики
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('stats', admin_stats))
+    application.add_handler(CommandHandler('export_users', export_users))
+    application.add_handler(CommandHandler('export_questions', export_questions))
+    application.add_handler(registration_handler)
+    application.add_handler(question_handler)
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Запускаем бота
+    logger.info("🤖 Бот запущен...")
+    print("=" * 50)
+    print("✅ БОТ ЗАПУЩЕН УСПЕШНО!")
+    print(f"🤖 Токен: {BOT_TOKEN[:10]}...")
+    print(f"👑 Админ ID: {ADMIN_ID}")
+    print("🔗 Ссылка для канала: https://t.me/ваш_бот?start=event_channel")
+    print("=" * 50)
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
