@@ -1,0 +1,36 @@
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+
+async def start(update: Update, context):
+    user = update.effective_user
+    # Клавиатура главного меню
+    keyboard = [
+        [InlineKeyboardButton("📝 Зарегистрироваться", callback_data='register')],
+        [InlineKeyboardButton("📁 Материалы мероприятия", callback_data='files')],
+        [InlineKeyboardButton("❓ Задать вопрос инспектору", callback_data='ask_question')],
+        [InlineKeyboardButton("👤 Моя информация", callback_data='my_info')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        f"Привет, {user.first_name}!\n"
+        f"Добро пожаловать в бот мероприятия «День Безопасности».\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup
+    )
+
+# Обработчики для callback_data (нажатий на кнопки меню)
+async def button_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == 'register':
+        # Запускаем процесс регистрации
+        await query.edit_message_text(text="Введите ваше ФИО:")
+        # ... логика пошагового опроса ...
+    elif query.data == 'files':
+        # Показываем кнопки с файлами
+        file_keyboard = [
+            [InlineKeyboardButton("Программа (PDF)", callback_data='file_program')],
+            [InlineKeyboardButton("Презентация (PPTX)", callback_data='file_presentation')],
+        ]
+        # ... и т.д.
